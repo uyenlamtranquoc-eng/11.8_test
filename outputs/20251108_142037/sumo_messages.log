@@ -1,0 +1,33 @@
+Loading net-file from 'C:\Users\33093\Desktop\限速控制算法进展\11.8xs\sumo/grid1x3.net.xml' ... done (2ms).
+Loading additional-files from 'C:\Users\33093\Desktop\限速控制算法进展\11.8xs\sumo/grid1x3.add.xml' ... done (1ms).
+Loading route-files incrementally from 'C:\Users\33093\Desktop\限速控制算法进展\11.8xs\sumo/grid1x3_weighted_mt.rou.pen30.xml'
+Loading done.
+Simulation version 1.24.0 started via libsumo with time: 0.00.
+Warning: Vehicle '330' performs emergency braking on lane 'J1_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=345.50.
+Warning: Vehicle '343' performs emergency braking on lane 'S1_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=352.00.
+Warning: Vehicle '160' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=359.00.
+Warning: Vehicle '161' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=359.50.
+Warning: Vehicle '230' performs emergency braking on lane 'J1_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=561.00.
+Warning: Vehicle '536' performs emergency braking on lane 'J2_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=689.50.
+Warning: Vehicle '242' performs emergency braking on lane 'J0_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=1088.00.
+Warning: Vehicle '1722' performs emergency braking on lane 'J0_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=1851.00.
+Warning: Vehicle '1801' performs emergency braking on lane 'J2_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=1938.00.
+Warning: Vehicle '2282' performs emergency braking on lane 'J0_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=2362.50.
+Warning: Vehicle '1281' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=2431.00.
+Warning: Vehicle '2369' performs emergency braking on lane 'J2_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=2448.00.
+Warning: Vehicle '2688' performs emergency braking on lane 'N1_J1_0' with decel=6.50, wished=4.50, severity=1.00, time=2700.00.
+Warning: Vehicle '1603' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=2954.00.
+Warning: Vehicle '3091' performs emergency braking on lane 'J0_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=3207.00.
+Warning: Vehicle '3210' performs emergency braking on lane 'J0_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=3224.00.
+Warning: Vehicle '2036' performs emergency braking on lane 'E_J2_1' with decel=6.50, wished=4.50, severity=1.00, time=3312.00.
+Simulation ended at time: 3606.50.
+Reason: Libsumo requested termination.
+Performance:
+ Duration: 10.97s
+ Real time factor: 328.64
+ UPS: 113615.181338
+Vehicles:
+ Inserted: 2020 (Loaded: 2710)
+ Running: 180
+ Waiting: 690
+ Emergency Braking: 17

@@ -241,33 +241,33 @@
     </edge>
 
     <tlLogic id="J0" type="static" programID="0" offset="0">
-        <phase duration="50" state="rrrrggggrrrrrggggr"/>
+        <phase duration="51" state="rrrrggggrrrrrggggr"/>
         <phase duration="5"  state="rrrrgyyyrrrrrgyyyr"/>
-        <phase duration="35" state="rrrrgrrrGrrrrgrrrG"/>
+        <phase duration="36" state="rrrrgrrrGrrrrgrrrG"/>
         <phase duration="5"  state="rrrrgrrryrrrrgrrry"/>
-        <phase duration="35" state="gggrgrrrrgggrgrrrr"/>
+        <phase duration="36" state="gggrgrrrrgggrgrrrr"/>
         <phase duration="5"  state="yyyrgrrrryyyrgrrrr"/>
-        <phase duration="25" state="rrrGgrrrrrrrGgrrrr"/>
+        <phase duration="27" state="rrrGgrrrrrrrGgrrrr"/>
         <phase duration="5"  state="rrrygrrrrrrrygrrrr"/>
     </tlLogic>
     <tlLogic id="J1" type="static" programID="0" offset="17">
-        <phase duration="50" state="rrrrggggrrrrrggggr"/>
+        <phase duration="51" state="rrrrggggrrrrrggggr"/>
         <phase duration="5"  state="rrrrgyyyrrrrrgyyyr"/>
-        <phase duration="35" state="rrrrgrrrGrrrrgrrrG"/>
+        <phase duration="36" state="rrrrgrrrGrrrrgrrrG"/>
         <phase duration="5"  state="rrrrgrrryrrrrgrrry"/>
-        <phase duration="35" state="gggrgrrrrgggrgrrrr"/>
+        <phase duration="36" state="gggrgrrrrgggrgrrrr"/>
         <phase duration="5"  state="yyyrgrrrryyyrgrrrr"/>
-        <phase duration="25" state="rrrGgrrrrrrrGgrrrr"/>
+        <phase duration="27" state="rrrGgrrrrrrrGgrrrr"/>
         <phase duration="5"  state="rrrygrrrrrrrygrrrr"/>
     </tlLogic>
     <tlLogic id="J2" type="static" programID="0" offset="34">
-        <phase duration="50" state="rrrrggggrrrrrggggr"/>
+        <phase duration="51" state="rrrrggggrrrrrggggr"/>
         <phase duration="5"  state="rrrrgyyyrrrrrgyyyr"/>
-        <phase duration="35" state="rrrrgrrrGrrrrgrrrG"/>
+        <phase duration="36" state="rrrrgrrrGrrrrgrrrG"/>
         <phase duration="5"  state="rrrrgrrryrrrrgrrry"/>
-        <phase duration="35" state="gggrgrrrrgggrgrrrr"/>
+        <phase duration="36" state="gggrgrrrrgggrgrrrr"/>
         <phase duration="5"  state="yyyrgrrrryyyrgrrrr"/>
-        <phase duration="25" state="rrrGgrrrrrrrGgrrrr"/>
+        <phase duration="27" state="rrrGgrrrrrrrGgrrrr"/>
         <phase duration="5"  state="rrrygrrrrrrrygrrrr"/>
     </tlLogic>
 

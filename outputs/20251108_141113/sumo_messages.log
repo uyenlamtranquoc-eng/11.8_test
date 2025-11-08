@@ -1,0 +1,5 @@
+Loading net-file from 'C:\Users\33093\Desktop\限速控制算法进展\11.8xs\sumo/grid1x3.net.xml' ... done (2ms).
+Loading additional-files from 'C:\Users\33093\Desktop\限速控制算法进展\11.8xs\sumo/grid1x3.add.xml' ... done (0ms).
+Loading route-files incrementally from 'C:\Users\33093\Desktop\限速控制算法进展\11.8xs\sumo/grid1x3_weighted_mt.rou.pen30.xml'
+Loading done.
+Simulation version 1.24.0 started via libsumo with time: 0.00.
