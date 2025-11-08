@@ -1,0 +1,8 @@
+Loading net-file from 'C:\Users\33093\Desktop\11.6xs\sumo/grid1x3.net.xml' ... done (1ms).
+Loading additional-files from 'C:\Users\33093\Desktop\11.6xs\sumo/grid1x3.add.xml' ... done (2ms).
+Loading route-files incrementally from 'C:\Users\33093\Desktop\11.6xs\sumo/grid1x3_weighted_mt.rou.pen30.xml'
+Loading done.
+Simulation version 1.24.0 started via libsumo with time: 0.00.
+Warning: Vehicle '107' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=215.00.
+Warning: Vehicle '194' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=368.50.
+Warning: Vehicle '490' performs emergency braking on lane 'E_J2_0' with decel=6.50, wished=4.50, severity=1.00, time=551.50.

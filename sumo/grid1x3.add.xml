@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<additional>
+    <!-- VSL控制区域检测器：仅控制直行车道（Lane 1） -->
+    
+    <!-- 东向控制区域：3个信号灯上游 -->
+    <!-- W -> J0 (length 239.60m): J0信号灯上游 -->
+    <laneAreaDetector id="det_W_J0_1" lane="W_J0_1" pos="189.60" length="50.00" freq="1" file="grid1x3_e2.out.xml" friendlyPos="true"/>
+    
+    <!-- J0 -> J1 (length 229.20m): J1信号灯上游 -->
+    <laneAreaDetector id="det_J0_J1_1" lane="J0_J1_1" pos="179.20" length="50.00" freq="1" file="grid1x3_e2.out.xml" friendlyPos="true"/>
+    
+    <!-- J1 -> J2 (length 229.20m): J2信号灯上游 -->
+    <laneAreaDetector id="det_J1_J2_1" lane="J1_J2_1" pos="179.20" length="50.00" freq="1" file="grid1x3_e2.out.xml" friendlyPos="true"/>
+    
+    <!-- 西向控制区域：3个信号灯上游 -->
+    <!-- E -> J2 (length 239.60m): J2西向上游 -->
+    <laneAreaDetector id="det_E_J2_1" lane="E_J2_1" pos="189.60" length="50.00" freq="1" file="grid1x3_e2.out.xml" friendlyPos="true"/>
+    
+    <!-- J2 -> J1 (length 229.20m): J1西向上游 -->
+    <laneAreaDetector id="det_J2_J1_1" lane="J2_J1_1" pos="179.20" length="50.00" freq="1" file="grid1x3_e2.out.xml" friendlyPos="true"/>
+    
+    <!-- J1 -> J0 (length 229.20m): J0西向上游 -->
+    <laneAreaDetector id="det_J1_J0_1" lane="J1_J0_1" pos="179.20" length="50.00" freq="1" file="grid1x3_e2.out.xml" friendlyPos="true"/>
+</additional>

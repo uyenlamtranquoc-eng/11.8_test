@@ -1,0 +1,30 @@
+Loading net-file from 'C:\Users\33093\Desktop\11.6xs\sumo/grid1x3.net.xml' ... done (2ms).
+Loading additional-files from 'C:\Users\33093\Desktop\11.6xs\sumo/grid1x3.add.xml' ... done (1ms).
+Loading route-files incrementally from 'C:\Users\33093\Desktop\11.6xs\sumo/grid1x3_weighted_mt.rou.pen30.xml'
+Loading done.
+Simulation version 1.24.0 started via libsumo with time: 0.00.
+Warning: Vehicle '107' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=215.00.
+Warning: Vehicle '194' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=368.50.
+Warning: Vehicle '490' performs emergency braking on lane 'E_J2_0' with decel=6.50, wished=4.50, severity=1.00, time=551.50.
+Warning: Vehicle '858' performs emergency braking on lane 'W_J0_1' with decel=6.50, wished=4.50, severity=1.00, time=1509.50.
+Warning: Vehicle '767' performs emergency braking on lane 'J1_J2_1' with decel=6.50, wished=4.50, severity=1.00, time=1734.50.
+Warning: Vehicle '1162' performs emergency braking on lane 'J1_J2_1' with decel=6.50, wished=4.50, severity=1.00, time=2065.00.
+Warning: Vehicle '1164' performs emergency braking on lane 'J1_J2_1' with decel=6.50, wished=4.50, severity=1.00, time=2065.50.
+Warning: Vehicle '1066' performs emergency braking on lane 'J2_J1_1' with decel=6.50, wished=4.50, severity=1.00, time=2377.00.
+Warning: Vehicle '2495' performs emergency braking on lane 'N2_J2_1' with decel=6.50, wished=4.50, severity=1.00, time=2504.00.
+Warning: Vehicle '1443' performs emergency braking on lane 'W_J0_0' with decel=6.50, wished=4.50, severity=1.00, time=2535.00.
+Warning: Vehicle '1444' performs emergency braking on lane 'W_J0_0' with decel=6.50, wished=4.50, severity=1.00, time=2535.50.
+Warning: Vehicle '2006' performs emergency braking on lane 'E_J2_1' with decel=6.50, wished=4.50, severity=1.00, time=3219.00.
+Warning: Vehicle '2020' performs emergency braking on lane 'E_J2_0' with decel=6.50, wished=4.50, severity=1.00, time=3237.00.
+Warning: Vehicle '2072' performs emergency braking on lane 'E_J2_0' with decel=6.50, wished=4.50, severity=1.00, time=3252.00.
+Simulation ended at time: 3608.50.
+Reason: Libsumo requested termination.
+Performance:
+ Duration: 6.98s
+ Real time factor: 516.829
+ UPS: 176808.937267
+Vehicles:
+ Inserted: 1985 (Loaded: 2710)
+ Running: 165
+ Waiting: 725
+ Emergency Braking: 14
