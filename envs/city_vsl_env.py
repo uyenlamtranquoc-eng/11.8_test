@@ -3,7 +3,9 @@ import os
 import sys
 import importlib
 import datetime
+from collections import deque
 from typing import Dict, List, Tuple, Optional
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -44,10 +46,22 @@ class CityVSLEnv(gym.Env):
         max_delta_kph: float = 10.0,  # 限速变化硬约束，论文式
         reward_speed_weight: float = 1.0,
         reward_congestion_weight: float = 1.0,
+        reward_delay_weight: float = 1.0,
+        reward_queue_overflow_weight: float = 1.0,
+        reward_stops_weight: float = 0.5,
+        reward_fuel_weight: float = 0.1,
+        reward_smoothness_weight: float = 0.2,
+        reward_coordination_weight: float = 0.5,
+        reward_throughput_weight: float = 0.3,
+        reward_demand_robust_weight: float = 0.3,
         reward_change_penalty: float = 0.1,
         warmup_steps: int = 5,
         reward_clip_min: Optional[float] = None,
         reward_clip_max: Optional[float] = None,
+        reward_queue_overflow_threshold: float = 0.8,
+        reward_delay_max_ratio_extra: float = 3.0,
+        reward_use_real_fuel: bool = False,
+        norm_cfg: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
 
@@ -66,6 +80,13 @@ class CityVSLEnv(gym.Env):
             "queue_steps": 0,
             "arrived_total": 0,
             "sim_seconds": 0,
+            # 归一指标累计（用于 episode 汇总）
+            "delay_sum_norm": 0.0,
+            "delay_steps": 0,
+            "stops_sum_norm": 0.0,
+            "stops_steps": 0,
+            "smooth_sum_norm": 0.0,
+            "smooth_steps": 0,
         }
 
         # 三段路（东向）
@@ -94,30 +115,65 @@ class CityVSLEnv(gym.Env):
         n_per_segment = len(self.speed_levels_mps) if self.speed_levels_mps else 1
         self.action_space = spaces.MultiDiscrete(np.array([n_per_segment] * 6, dtype=np.int64))
 
-        # 观测空间简化（城市VSL基础版）：
-        # 东向3段 + 西向3段：每段 occ + speed = 2 * 6 = 12
-        # 每信号: phase + remaining = 2 * 3 = 6
-        # CAV ratio = 1
-        # 总计: 12 + 6 + 1 = 19
-        self.obs_dim = 2 * len(self.group_keys) * 2 + 2 * len(self.tls_ids) + 1
+        # 观测空间（增强版 + 双趋势 + 全局CAV）：
+        # 东向3段 + 西向3段：每段 occ + speed + halts_norm = 3 * 6 = 18
+        # 每信号: phase_norm + remain_norm + next_green_start_norm + next_green_duration_norm = 4 * 3 = 12
+        # 需求趋势（60s滑动）= 1；慢趋势（5min滑动）= 1
+        # 全局 CAV 占比（episode 级 sanity check）= 1
+        # 每段 CAV 占比 = 6
+        # 每段速度波动（与上一步的差值，归一化）= 6
+        self.obs_dim = (3 * len(self.group_keys) * 2) + (4 * len(self.tls_ids)) + 2 + 1 + (len(self.group_keys) * 2) + (len(self.group_keys) * 2)
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32
         )
 
         # reward 权重：对应论文的多目标
         self.rw = {
-            "efficiency": float(reward_speed_weight),      # 整体速度（双向平均）
-            "congestion": float(reward_congestion_weight), # 停车/排队（双向合并）
-            "action_change": float(reward_change_penalty), # 动作变化（硬约束下保持轻惩罚）
+            "efficiency": float(reward_speed_weight),
+            "congestion": float(reward_congestion_weight),
+            "delay": float(reward_delay_weight),
+            "queue_overflow": float(reward_queue_overflow_weight),
+            "stops": float(reward_stops_weight),
+            "fuel": float(reward_fuel_weight),
+            "smoothness": float(reward_smoothness_weight),
+            "coordination": float(reward_coordination_weight),
+            "throughput": float(reward_throughput_weight),
+            "demand_robust": float(reward_demand_robust_weight),
+            "action_change": float(reward_change_penalty),
+            # 新增：信号遵从惩罚与绿窗通过奖励（默认权重，可根据需要调整）
+            "signal_compliance": 0.2,
+            "green_pass": 0.3,
         }
 
         self._reward_clip_min = reward_clip_min
         self._reward_clip_max = reward_clip_max
 
+        # 奖励归一与阈值
+        self.queue_overflow_threshold = float(reward_queue_overflow_threshold)
+        self.delay_max_ratio_extra = float(reward_delay_max_ratio_extra)
+        self.use_real_fuel = bool(reward_use_real_fuel)
+
         # 归一化参考：速度按离散档位最大值（至少 20 m/s）；信号按实际程序配置
         self.max_ref_speed_mps = max(20.0, max(self.speed_levels_mps)) if self.speed_levels_mps else 20.0
         self._tls_phase_meta: Dict[str, Dict[str, float]] = {}
+        # 周期级信号缓存：每相位时长、是否含绿、总周期长度等
+        self._tls_cycle_meta: Dict[str, Dict[str, object]] = {}
         self._green_phase_cache: Dict[str, set] = {}
+        # 路段↔信号映射与信号状态缓存（用于动作耦合）
+        self.segment_tls_map: Dict[str, Dict[str, str]] = {"eb": {}, "wb": {}}
+        self._prev_tls_green_state: Dict[str, bool] = {tid: False for tid in (self.tls_ids or [])}
+        self._prev_segment_speeds_norm: Dict[str, Dict[str, float]] = {"eb": {}, "wb": {}}
+        self._prev_meas_segment_speeds_norm: Dict[str, Dict[str, float]] = {"eb": {}, "wb": {}}
+        self._fuel_hist: deque = deque(maxlen=int(max(3, round(600.0 / float(max(self.decision_interval, 1))))))
+        # 需求趋势：最近数步到达流率（veh/s）的滑动窗口（快与慢两个时间尺度）
+        self._trend_window_steps: int = int(max(3, round(60.0 / float(max(self.decision_interval, 1)))))
+        self._arrival_rate_hist: deque = deque(maxlen=self._trend_window_steps)
+        self._trend_window_steps_slow: int = int(max(3, round(300.0 / float(max(self.decision_interval, 1)))))  # 5分钟窗口
+        self._arrival_rate_hist_slow: deque = deque(maxlen=self._trend_window_steps_slow)
+        # 归一化参考通行能力（veh/h）：按下游段车道数估计
+        down_lanes = len(self.lane_groups.get("down", [])) + len(self.wb_lane_groups.get("down", []))
+        down_lanes = int(max(down_lanes, 1))
+        self._ref_throughput_vph: float = float(1800 * down_lanes)
 
         # 仿真时间（秒，按 SUMO 实时累计）
         self.sim_time = 0.0
@@ -147,6 +203,39 @@ class CityVSLEnv(gym.Env):
         # 每次运行使用独立时间戳子目录：outputs/YYYYMMDD_HHMMSS
         self.run_output_dir = self._make_run_output_dir()
         self._run_additional_path = None
+
+        # 走廊出口集合（用于“仅走廊范围”的需求趋势）
+        self._corridor_exit_edges: List[str] = []
+        self._corridor_exit_lanes: List[str] = []
+        self._corridor_exit_seen: set = set()
+
+        # —— 归一策略（场景适配）——
+        self.norm_cfg = norm_cfg or {}
+        # halts 归一上限策略
+        self.halts_upper_strategy: str = str(self.norm_cfg.get("halts_upper_strategy", "by_lane_length_and_p95")).lower()
+        self.halts_fixed_upper: float = float(self.norm_cfg.get("halts_fixed_upper", 5.0))
+        self.jam_spacing_m: float = float(self.norm_cfg.get("jam_spacing_m", 7.5))
+        self._halts_window_steps: int = int(max(3, round(float(self.norm_cfg.get("halts_window_seconds", 600)) / float(max(self.decision_interval, 1)))))
+        # rolling 历史：分方向、分段
+        self._halts_hist_eb: Dict[str, deque] = {g: deque(maxlen=self._halts_window_steps) for g in self.group_keys}
+        self._halts_hist_wb: Dict[str, deque] = {g: deque(maxlen=self._halts_window_steps) for g in self.group_keys}
+        # 车道长度缓存与分段物理上限（按长度估算）
+        self._lane_length_cache: Dict[str, float] = {}
+        self._halts_upper_eb: Dict[str, float] = {g: float(self.halts_fixed_upper) for g in self.group_keys}
+        self._halts_upper_wb: Dict[str, float] = {g: float(self.halts_fixed_upper) for g in self.group_keys}
+
+        # 吞吐参考策略
+        self.throughput_ref_strategy: str = str(self.norm_cfg.get("throughput_ref_strategy", "rolling_p95")).lower()
+        self.saturation_flow_per_lane_vphg: float = float(self.norm_cfg.get("saturation_flow_per_lane_vphg", 1800.0))
+        self.progression_factor: float = float(self.norm_cfg.get("progression_factor", 0.9))
+        self._throughput_window_steps: int = int(max(3, round(float(self.norm_cfg.get("throughput_window_seconds", 600)) / float(max(self.decision_interval, 1)))))
+        self._throughput_ref_hist: deque = deque(maxlen=self._throughput_window_steps)
+        try:
+            self._init_corridor_exits()
+        except Exception:
+            self._corridor_exit_edges = []
+            self._corridor_exit_lanes = []
+            self._corridor_exit_seen = set()
 
         # 起 SUMO
         self._init_sumo()
@@ -269,12 +358,93 @@ class CityVSLEnv(gym.Env):
         # 不在控制台打印后端信息；如需调试，可写入消息日志
         # 缓存信号相位元数据用于归一化
         self._compute_tls_phase_meta()
+        # 构建默认的“段→下游信号”映射（启发式：段索引+1 → 信号索引）
+        self._build_segment_tls_map()
+
+    # --------------------------------------------------------
+    def _get_net_file_path_from_sumocfg(self) -> Optional[str]:
+        """从 sumo_cfg_path 解析 net.xml 的路径。"""
+        try:
+            tree = ET.parse(self.sumo_cfg_path)
+            root = tree.getroot()
+            net_file_val = None
+            for elem in root.iter():
+                if elem.tag.endswith('net-file'):
+                    net_file_val = elem.attrib.get('value')
+                    if net_file_val:
+                        break
+            if not net_file_val:
+                return None
+            base = os.path.dirname(self.sumo_cfg_path)
+            return os.path.join(base, net_file_val)
+        except Exception:
+            return None
+
+    # --------------------------------------------------------
+    def _init_corridor_exits(self) -> None:
+        """识别走廊下游出口边与车道（EB: 终点→E；WB: 终点→W）。"""
+        net_path = self._get_net_file_path_from_sumocfg()
+        if not net_path or not os.path.exists(net_path):
+            return
+
+        def _edge_id_from_lane(lid: str) -> Optional[str]:
+            parts = lid.split('_')
+            if len(parts) < 3:
+                return None
+            return '_'.join(parts[:-1])
+
+        def _to_node_from_edge(eid: str) -> Optional[str]:
+            parts = eid.split('_')
+            if len(parts) < 2:
+                return None
+            return parts[-1]
+
+        eb_end_node = 'J2'
+        wb_end_node = 'J0'
+        eb_down_lanes = self.lane_groups.get('down', [])
+        wb_down_lanes = self.wb_lane_groups.get('down', [])
+        if eb_down_lanes:
+            eb_eid = _edge_id_from_lane(eb_down_lanes[0])
+            maybe = _to_node_from_edge(eb_eid) if eb_eid else None
+            if maybe:
+                eb_end_node = maybe
+        if wb_down_lanes:
+            wb_eid = _edge_id_from_lane(wb_down_lanes[0])
+            maybe = _to_node_from_edge(wb_eid) if wb_eid else None
+            if maybe:
+                wb_end_node = maybe
+
+        eb_boundary_to = 'E'
+        wb_boundary_to = 'W'
+
+        try:
+            tree = ET.parse(net_path)
+            root = tree.getroot()
+            exit_edges: List[str] = []
+            exit_lanes: List[str] = []
+            for edge in root.findall('edge'):
+                eid = edge.attrib.get('id', '')
+                frm = edge.attrib.get('from', '')
+                to = edge.attrib.get('to', '')
+                if (frm == eb_end_node and to == eb_boundary_to) or (frm == wb_end_node and to == wb_boundary_to):
+                    exit_edges.append(eid)
+                    for lane in edge.findall('lane'):
+                        lid = lane.attrib.get('id')
+                        if lid:
+                            exit_lanes.append(lid)
+            self._corridor_exit_edges = exit_edges
+            self._corridor_exit_lanes = exit_lanes
+        except Exception:
+            self._corridor_exit_edges = []
+            self._corridor_exit_lanes = []
 
     def _compute_tls_phase_meta(self) -> None:
+        """解析当前程序的信号相位，并构建周期级缓存用于后续特征计算。"""
         self._tls_phase_meta = {}
+        self._tls_cycle_meta = {}
         for tid in self.tls_ids:
             try:
-                # 选择当前程序对应的逻辑，避免弃用 API 警告
+                # 选择当前程序对应的逻辑
                 try:
                     curr_prog = traci.trafficlight.getProgram(tid)
                 except Exception:
@@ -296,46 +466,317 @@ class CityVSLEnv(gym.Env):
                         logic = logics[0]
 
                 phase_count = 0
-                max_dur = 1.0
+                max_dur = 60.0
                 green_phases = set()
+                durations: List[float] = []
+                greens: List[bool] = []
+                cum_durs: List[float] = []
+                cycle_len = 0.0
                 if logic is not None:
                     phases = logic.getPhases() if hasattr(logic, "getPhases") else getattr(logic, "phases", [])
                     phase_count = len(phases) if phases else 0
                     if phases:
-                        try:
-                            max_dur = max(
-                                float(
-                                    getattr(p, "duration", 0.0)
-                                    if hasattr(p, "duration") else getattr(p, "maxDur", 0.0)
-                                )
-                                for p in phases
-                            ) or 1.0
-                        except Exception:
-                            max_dur = 60.0
-                        # 识别绿灯相位：相位定义中包含'G'
                         for idx, p in enumerate(phases):
-                            state = getattr(p, "state", "") if hasattr(p, "state") else str(p)
-                            if 'G' in state or 'g' in state:
+                            try:
+                                d = float(getattr(p, "duration", None) or getattr(p, "maxDur", 0.0) or 0.0)
+                            except Exception:
+                                d = 0.0
+                            d = max(d, 0.0)
+                            durations.append(d)
+                            try:
+                                state = getattr(p, "state", "") if hasattr(p, "state") else str(p)
+                            except Exception:
+                                state = ""
+                            isg = ('G' in state) or ('g' in state)
+                            greens.append(isg)
+                            if isg:
                                 green_phases.add(idx)
+                        cycle_len = float(sum(durations)) if durations else 0.0
+                        try:
+                            max_dur = max(durations) if durations else max_dur
+                        except Exception:
+                            pass
+                        # 累积时长
+                        s = 0.0
+                        for d in durations:
+                            s += d
+                            cum_durs.append(s)
                 if phase_count <= 0:
-                    phase_count = max(1, int(traci.trafficlight.getPhase(tid)) + 1)
-                    remain = traci.trafficlight.getNextSwitch(tid) - traci.simulation.getTime()
-                    max_dur = max(1.0, float(remain))
+                    # 退化：仅用当前相位与剩余时间近似
+                    try:
+                        phase_count = max(1, int(traci.trafficlight.getPhase(tid)) + 1)
+                        remain = traci.trafficlight.getNextSwitch(tid) - traci.simulation.getTime()
+                        max_dur = max(1.0, float(remain))
+                    except Exception:
+                        phase_count = 8
+                        max_dur = 60.0
+                    durations = [max_dur]
+                    greens = [False]
+                    cycle_len = float(max_dur)
+                    green_phases = set()
+                    cum_durs = [cycle_len]
+
+                # 写入缓存
                 self._tls_phase_meta[tid] = {
-                    "phase_count": float(phase_count), 
-                    "max_phase_duration": float(max_dur)
+                    "phase_count": float(phase_count),
+                    "max_phase_duration": float(max_dur),
+                }
+                self._tls_cycle_meta[tid] = {
+                    "durations": durations,
+                    "greens": greens,
+                    "cycle_len": float(max(cycle_len, 1e-6)),
+                    "cum_durations": cum_durs,
                 }
                 self._green_phase_cache[tid] = green_phases
             except traci.TraCIException:
                 self._tls_phase_meta[tid] = {"phase_count": 8.0, "max_phase_duration": 60.0}
+                self._tls_cycle_meta[tid] = {
+                    "durations": [60.0],
+                    "greens": [False],
+                    "cycle_len": 60.0,
+                    "cum_durations": [60.0],
+                }
                 self._green_phase_cache[tid] = set()
             except Exception:
                 self._tls_phase_meta[tid] = {"phase_count": 8.0, "max_phase_duration": 60.0}
+                self._tls_cycle_meta[tid] = {
+                    "durations": [60.0],
+                    "greens": [False],
+                    "cycle_len": 60.0,
+                    "cum_durations": [60.0],
+                }
                 self._green_phase_cache[tid] = set()
     
     def _is_green_phase(self, tls_id: str, phase_idx: int) -> bool:
         """判断指定信号的指定相位是否为绿灯。"""
         return phase_idx in self._green_phase_cache.get(tls_id, set())
+
+    # --------------------------------------------------------
+    def _build_segment_tls_map(self) -> None:
+        """建立每段对应的下游信号映射。
+
+        简化策略：按段索引 0/1/2 分别映射到 tls_ids[1], tls_ids[2], tls_ids[-1]（尾段复用最后一个信号）。
+        若信号数量不足，则使用最后一个信号兜底。东/西向共享同序映射。
+        """
+        ids = list(self.tls_ids or [])
+        if not ids:
+            return
+        last_idx = len(ids) - 1
+        for i, g in enumerate(self.group_keys):
+            tls_idx = min(i + 1, last_idx)
+            tls_id = ids[tls_idx]
+            self.segment_tls_map.setdefault("eb", {})[g] = tls_id
+            self.segment_tls_map.setdefault("wb", {})[g] = tls_id
+
+    # --------------------------------------------------------
+    def _apply_signal_speed_coupling(self, target_speeds: Tuple[float, ...]) -> Tuple[float, ...]:
+        """在车辆施加前，依据信号绿窗、排队与需求，对每段目标速度进行耦合约束。"""
+        # 确保有最新的分段指标（含占有率）
+        lm = self._step_cache.get("lane_metrics")
+        if lm is None:
+            try:
+                self._collect_lane_group_metrics(need_occ=True)
+            except Exception:
+                pass
+            lm = self._step_cache.get("lane_metrics", {"eb": {}, "wb": {}})
+
+        prev = np.array(self._last_action_speeds, dtype=float)
+        ts = np.array(list(target_speeds), dtype=float)
+        base_delta = float(self.max_delta_kph) / 3.6
+        demand = float(self.metrics.get("demand_trend_norm", 0.0))
+        slow_mps = 12.0
+        occ_thr = 0.30
+        h_thr = float(self.queue_overflow_threshold)
+
+        for direction, offset in (("eb", 0), ("wb", 3)):
+            for seg_idx, seg in enumerate(self.group_keys):
+                i = offset + seg_idx
+                tls_id = self.segment_tls_map.get(direction, {}).get(seg)
+                if not tls_id:
+                    continue
+                # 实时信号状态
+                try:
+                    t_now = float(traci.simulation.getTime())
+                except Exception:
+                    t_now = 0.0
+                try:
+                    phase_idx = int(traci.trafficlight.getPhase(tls_id))
+                    next_switch = float(traci.trafficlight.getNextSwitch(tls_id))
+                    remain_curr = max(0.0, next_switch - t_now)
+                    is_now_green = bool(self._is_green_phase(tls_id, phase_idx))
+                except Exception:
+                    remain_curr = 0.0
+                    is_now_green = False
+
+                # 绿灯窗口（归一值 → 真实秒）
+                try:
+                    is_green_now, start_norm, dur_norm = self._get_tls_green_window_features(tls_id)
+                except Exception:
+                    is_green_now, start_norm, dur_norm = (0.0, 1.0, 0.0)
+                meta = self._tls_cycle_meta.get(tls_id, {})
+                cycle_len = float(meta.get("cycle_len", 60.0))
+                start_sec = float(start_norm) * cycle_len
+                dur_sec = float(dur_norm) * cycle_len
+
+                # 段拥挤与溢出
+                vals = lm.get(direction, {}).get(seg, {})
+                avg_halts = float(vals.get("halts", 0.0))
+                upper_halts = self._get_halts_upper_for_segment(direction, seg)
+                halts_norm = max(0.0, min(avg_halts / float(max(upper_halts, 1e-6)), 1.0))
+                occ = float(vals.get("occ", 0.0))
+
+                # 红灯慢行与追赶策略
+                if is_green_now < 1.0:
+                    slow_cap = slow_mps * (1.0 - 0.25 * min(max(demand, 0.0), 1.0))
+                    near_green = (start_sec <= (2.0 * float(self.decision_interval)))
+                    if near_green:
+                        alpha = max(0.0, min(1.0 - (start_sec / (2.0 * float(self.decision_interval))), 1.0))
+                        cap = slow_cap + alpha * (self.max_ref_speed_mps - slow_cap)
+                        ts[i] = min(ts[i], cap)
+                    else:
+                        ts[i] = min(ts[i], slow_cap)
+
+                # 溢出抑制：占有率或 halts_norm 超阈，对上游更严格限速
+                if (halts_norm > h_thr) or (occ > occ_thr):
+                    ts[i] = min(ts[i], max(prev[i], slow_mps))
+                    local_delta = base_delta * 0.5
+                    diff = float(ts[i] - prev[i])
+                    ts[i] = prev[i] + np.sign(diff) * min(abs(diff), local_delta)
+
+                # 绿窗不足则平滑下降：避免中段突然停车
+                def _seg_len_avg(direction: str, segment: str) -> float:
+                    lane_ids = (self.lane_groups if direction == "eb" else self.wb_lane_groups).get(segment, [])
+                    if not lane_ids:
+                        return 0.0
+                    lengths: List[float] = []
+                    for lid in lane_ids:
+                        try:
+                            L = float(self._lane_length_cache.get(lid)) if lid in self._lane_length_cache else float(traci.lane.getLength(lid))
+                            self._lane_length_cache[lid] = L
+                            lengths.append(L)
+                        except Exception:
+                            pass
+                    return float(np.mean(lengths)) if lengths else 0.0
+
+                if is_now_green and dur_sec > 0.0:
+                    L = _seg_len_avg(direction, seg)
+                    if L > 0.0 and ts[i] > 0.1:
+                        pass_time = L / float(max(ts[i], 1e-3))
+                        if dur_sec < pass_time:
+                            ts[i] = max(slow_mps, min(ts[i], (slow_mps + ts[i]) * 0.5))
+
+                # 信号切换下的变幅协同
+                prev_green = bool(self._prev_tls_green_state.get(tls_id, False))
+                local_factor = 1.0
+                if (not prev_green) and is_now_green:
+                    # 红→绿：临时放宽变幅以尽快恢复
+                    local_factor = 2.0
+                elif prev_green and (not is_now_green) and (remain_curr <= float(self.decision_interval)):
+                    # 绿→红且剩余很短：收紧变幅，避免突升
+                    local_factor = 0.5
+
+                diff = float(ts[i] - prev[i])
+                ts[i] = prev[i] + np.sign(diff) * min(abs(diff), base_delta * local_factor)
+                self._prev_tls_green_state[tls_id] = bool(is_now_green == 1.0)
+
+        return tuple(float(x) for x in ts.tolist())
+
+    # --------------------------------------------------------
+    def _compute_halts_upper_bounds(self) -> None:
+        """按车道长度与拥挤间距估算各分段的 halts 物理上限（每车道队列容量的分段平均）。"""
+        # 东向
+        for gname in self.group_keys:
+            lanes = self.lane_groups.get(gname, [])
+            capacities: List[float] = []
+            for lid in lanes:
+                try:
+                    L = float(self._lane_length_cache.get(lid)) if lid in self._lane_length_cache else float(traci.lane.getLength(lid))
+                    self._lane_length_cache[lid] = L
+                    if L > 0.0 and self.jam_spacing_m > 0.0:
+                        capacities.append(float(L) / float(self.jam_spacing_m))
+                except Exception:
+                    pass
+            upper = float(np.mean(capacities)) if capacities else float(self.halts_fixed_upper)
+            self._halts_upper_eb[gname] = float(max(upper, 1.0))
+        # 西向
+        for gname in self.group_keys:
+            lanes = self.wb_lane_groups.get(gname, [])
+            capacities: List[float] = []
+            for lid in lanes:
+                try:
+                    L = float(self._lane_length_cache.get(lid)) if lid in self._lane_length_cache else float(traci.lane.getLength(lid))
+                    self._lane_length_cache[lid] = L
+                    if L > 0.0 and self.jam_spacing_m > 0.0:
+                        capacities.append(float(L) / float(self.jam_spacing_m))
+                except Exception:
+                    pass
+            upper = float(np.mean(capacities)) if capacities else float(self.halts_fixed_upper)
+            self._halts_upper_wb[gname] = float(max(upper, 1.0))
+
+    def _get_halts_upper_for_segment(self, direction: str, segment: str) -> float:
+        """根据策略返回指定方向/分段的 halts 归一上限。"""
+        base_len_upper = None
+        try:
+            if direction == "eb":
+                base_len_upper = self._halts_upper_eb.get(segment, None)
+            else:
+                base_len_upper = self._halts_upper_wb.get(segment, None)
+        except Exception:
+            base_len_upper = None
+        base_len_upper = float(base_len_upper) if base_len_upper is not None else float(self.halts_fixed_upper)
+
+        # rolling p95
+        try:
+            hist = (self._halts_hist_eb if direction == "eb" else self._halts_hist_wb).get(segment, deque(maxlen=self._halts_window_steps))
+            vals = list(hist)
+            p95 = float(np.percentile(vals, 95.0)) if vals else None
+        except Exception:
+            p95 = None
+
+        strat = (self.halts_upper_strategy or "by_lane_length_and_p95").lower()
+        if strat == "fixed":
+            upper = float(self.halts_fixed_upper)
+        elif strat == "by_lane_length":
+            upper = float(base_len_upper)
+        elif strat == "rolling_p95":
+            upper = float(p95) if p95 is not None else float(self.halts_fixed_upper)
+        else:  # by_lane_length_and_p95
+            if p95 is not None:
+                upper = float(max(base_len_upper, float(p95)))
+            else:
+                upper = float(base_len_upper)
+        return float(max(upper, 1e-6))
+
+    def _get_ref_throughput_vph(self) -> float:
+        """根据策略返回走廊吞吐归一参考（veh/h）。默认为 Rolling P95，自适应当前信号与到达。"""
+        # 优先使用自动识别的出口车道数，否则用下游分段车道数
+        try:
+            exit_lane_count = int(len(self._corridor_exit_lanes))
+        except Exception:
+            exit_lane_count = 0
+        if exit_lane_count <= 0:
+            try:
+                exit_lane_count = int(max(len(self.lane_groups.get("down", [])) + len(self.wb_lane_groups.get("down", [])), 1))
+            except Exception:
+                exit_lane_count = 1
+
+        strat = (self.throughput_ref_strategy or "rolling_p95").lower()
+        if strat == "fixed_per_lane_1800":
+            ref_vph = float(self.saturation_flow_per_lane_vphg) * float(exit_lane_count) * float(max(min(self.progression_factor, 1.0), 0.0))
+            return float(max(ref_vph, 1e-6))
+
+        # rolling_p95：用过去窗口的到达率（veh/s）95分位
+        try:
+            vals = list(self._throughput_ref_hist)
+            p95_per_s = float(np.percentile(vals, 95.0)) if vals else None
+            if p95_per_s is not None:
+                ref_vph = float(p95_per_s * 3600.0)
+            else:
+                # 兜底：固定每车道1800并乘出口车道数
+                ref_vph = float(self.saturation_flow_per_lane_vphg) * float(exit_lane_count)
+        except Exception:
+            ref_vph = float(self.saturation_flow_per_lane_vphg) * float(exit_lane_count)
+        return float(max(ref_vph, 1e-6))
 
     # --------------------------------------------------------
     def _make_run_output_dir(self) -> str:
@@ -397,6 +838,37 @@ class CityVSLEnv(gym.Env):
         self._last_action_index = -1
         init_speed = (self.speed_levels_mps[0] if self.speed_levels_mps else 20.0)
         self._last_action_speeds = (init_speed,) * 6
+        self._prev_segment_speeds_norm = {"eb": {}, "wb": {}}
+        self._arrival_rate_hist.clear()
+        try:
+            self._arrival_rate_hist_slow.clear()
+        except Exception:
+            pass
+        # 清空走廊出口追踪集合
+        try:
+            self._corridor_exit_seen.clear()
+        except Exception:
+            self._corridor_exit_seen = set()
+
+        # 清空 rolling 历史并更新分段物理上限
+        try:
+            self._throughput_ref_hist.clear()
+        except Exception:
+            pass
+        try:
+            for g in self.group_keys:
+                try:
+                    self._halts_hist_eb.get(g, deque()).clear()
+                    self._halts_hist_wb.get(g, deque()).clear()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 依赖 TraCI 的车道长度：需在 SUMO 初始化后计算
+        try:
+            self._compute_halts_upper_bounds()
+        except Exception as e:
+            print(f"[warn] 计算 halts 物理上限失败：{e}")
 
         # 清空评估累计
         self.metrics = {
@@ -462,6 +934,12 @@ class CityVSLEnv(gym.Env):
                     new_v = prev_v - max_delta_mps
             clipped_speeds.append(new_v)
         target_speeds = tuple(clipped_speeds)
+
+        # 3.1 信号耦合：在车辆施加前，根据红绿灯窗口与拥挤、需求，对目标速度做约束
+        try:
+            target_speeds = self._apply_signal_speed_coupling(target_speeds)
+        except Exception as e:
+            print(f"[警告] 信号限速耦合失败: {e}")
 
         ep_reward = 0.0
 
@@ -600,8 +1078,67 @@ class CityVSLEnv(gym.Env):
             for vid in arrived_ids:
                 self.metrics["arrived_total"] += 1
 
+            # 3.1) 走廊到达：匹配上一步在走廊出口车道上的车辆
+            try:
+                arrived_corridor = [vid for vid in arrived_ids if vid in self._corridor_exit_seen]
+            except Exception:
+                arrived_corridor = []
+            # 清理已到达的车辆标记，避免集合膨胀
+            for vid in arrived_corridor:
+                try:
+                    self._corridor_exit_seen.discard(vid)
+                except Exception:
+                    pass
+
             # 4) 仿真时长累计（秒）
             self.metrics["sim_seconds"] += dt_s
+
+            # 需求趋势（仅走廊范围）：到达流率（veh/s）滑动均值（归一为 veh/h / ref_vph）
+            try:
+                inst_rate_per_s = float(len(arrived_corridor)) / float(max(dt_s, 1e-6))
+            except Exception:
+                inst_rate_per_s = 0.0
+            self._arrival_rate_hist.append(inst_rate_per_s)
+            self._arrival_rate_hist_slow.append(inst_rate_per_s)
+            try:
+                self._throughput_ref_hist.append(inst_rate_per_s)
+            except Exception:
+                pass
+            try:
+                avg_rate_per_s = float(np.mean(list(self._arrival_rate_hist))) if self._arrival_rate_hist else 0.0
+            except Exception:
+                avg_rate_per_s = 0.0
+            avg_rate_vph = avg_rate_per_s * 3600.0
+            ref_throughput_vph = self._get_ref_throughput_vph()
+            trend_norm = max(0.0, min(avg_rate_vph / float(max(ref_throughput_vph, 1e-6)), 1.0))
+            self.metrics["arrival_rate_vph_ma"] = avg_rate_vph
+            self.metrics["demand_trend_norm"] = trend_norm
+            self.metrics["ref_throughput_vph"] = ref_throughput_vph
+
+            # 慢趋势（5分钟滑动窗口）
+            try:
+                avg_rate_per_s_slow = float(np.mean(list(self._arrival_rate_hist_slow))) if self._arrival_rate_hist_slow else 0.0
+            except Exception:
+                avg_rate_per_s_slow = 0.0
+            avg_rate_vph_slow = avg_rate_per_s_slow * 3600.0
+            trend_slow_norm = max(0.0, min(avg_rate_vph_slow / float(max(ref_throughput_vph, 1e-6)), 1.0))
+            self.metrics["arrival_rate_vph_ma_5min"] = avg_rate_vph_slow
+            self.metrics["demand_trend_slow_norm"] = trend_slow_norm
+
+            # 3.2) 更新走廊出口车道上的车辆集合，用于下一步匹配到达
+            try:
+                for lid in self._corridor_exit_lanes or []:
+                    try:
+                        vids_on_exit = traci.lane.getLastStepVehicleIDs(lid)
+                    except Exception:
+                        vids_on_exit = []
+                    for vid in vids_on_exit:
+                        try:
+                            self._corridor_exit_seen.add(vid)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             # 计算奖励（基本错误处理）
             try:
@@ -658,11 +1195,22 @@ class CityVSLEnv(gym.Env):
         avg_queue = (self.metrics.get("queue_sum", 0.0) / q_steps) if q_steps > 0 else 0.0
         throughput = (arrived / sim_sec * 3600.0) if sim_sec > 0 else 0.0
 
+        # 旅行时间/延误（归一）、停车延迟（归一）、速度波动（归一）
+        d_steps = int(self.metrics.get("delay_steps", 0) or 0)
+        s_steps = int(self.metrics.get("stops_steps", 0) or 0)
+        sm_steps = int(self.metrics.get("smooth_steps", 0) or 0)
+        avg_delay_norm = (float(self.metrics.get("delay_sum_norm", 0.0)) / d_steps) if d_steps > 0 else 0.0
+        avg_stops_norm = (float(self.metrics.get("stops_sum_norm", 0.0)) / s_steps) if s_steps > 0 else 0.0
+        avg_speed_fluct_norm = (float(self.metrics.get("smooth_sum_norm", 0.0)) / sm_steps) if sm_steps > 0 else 0.0
+
         return {
             "avg_queue_veh": avg_queue,
             "throughput_veh_per_hour": throughput,
             "arrived_total": arrived,
             "sim_seconds": sim_sec,
+            "avg_delay_norm": avg_delay_norm,
+            "avg_stops_norm": avg_stops_norm,
+            "avg_speed_fluct_norm": avg_speed_fluct_norm,
         }
 
     # --------------------------------------------------------
@@ -724,6 +1272,97 @@ class CityVSLEnv(gym.Env):
             lm["wb"][g] = data_wb
 
     # --------------------------------------------------------
+    def _get_cav_ratio_on_lanes(self, lane_ids: List[str]) -> float:
+        total = 0
+        cav = 0
+        for lid in lane_ids or []:
+            try:
+                vids = traci.lane.getLastStepVehicleIDs(lid)
+            except Exception:
+                vids = []
+            total += len(vids)
+            for vid in vids:
+                try:
+                    if traci.vehicle.getTypeID(vid) == self.cav_type_id:
+                        cav += 1
+                except Exception:
+                    pass
+        if total <= 0:
+            return 0.0
+        return cav / float(total)
+
+    # --------------------------------------------------------
+    def _get_tls_green_window_features(self, tls_id: str) -> Tuple[float, float, float]:
+        """返回 (is_green_now, next_green_start_norm, next_green_duration_norm)。
+
+        使用预解析的 _tls_cycle_meta（相位 durations / greens / cycle_len），
+        归一化基于一个相位周期（durations 之和）。
+        若当前为绿灯，则起始偏移为 0，持续为当前绿窗剩余时间 + 后续连续绿相位持续；
+        若当前非绿，则起始偏移为直到下一绿窗的时间，持续为该绿窗的连续绿时长。
+        """
+        # 当前相位与剩余时间（实时）
+        try:
+            t_now = float(traci.simulation.getTime())
+        except Exception:
+            t_now = 0.0
+        try:
+            phase_idx = int(traci.trafficlight.getPhase(tls_id))
+            next_switch = float(traci.trafficlight.getNextSwitch(tls_id))
+            remain_curr = max(0.0, next_switch - t_now)
+        except Exception:
+            phase_idx = 0
+            remain_curr = 0.0
+
+        meta = self._tls_cycle_meta.get(tls_id, None)
+        if not meta:
+            # 回退：无缓存时使用当前相位时长近似
+            cycle_len = max(remain_curr, 1.0)
+            is_green_now = 1.0 if self._is_green_phase(tls_id, phase_idx) else 0.0
+            start_norm = 0.0 if is_green_now == 1.0 else min(remain_curr / cycle_len, 1.0)
+            dur_norm = min(remain_curr / cycle_len, 1.0)
+            return (is_green_now, start_norm, dur_norm)
+
+        durations: List[float] = list(meta.get("durations", []))
+        greens: List[bool] = list(meta.get("greens", []))
+        cycle_len: float = float(meta.get("cycle_len", 1.0))
+        n = len(durations)
+        cycle_len = max(cycle_len, 1e-6)
+
+        # 当前是否绿灯
+        is_now_green = bool(greens and 0 <= phase_idx < n and greens[phase_idx])
+        is_green_now = 1.0 if is_now_green else 0.0
+
+        if is_now_green:
+            # 当前绿窗剩余 + 后续连续绿相位持续
+            dur = float(remain_curr)
+            if n > 0:
+                i = (phase_idx + 1) % n
+                while greens[i] and i != phase_idx:
+                    dur += float(durations[i])
+                    i = (i + 1) % n
+            start_norm = 0.0
+            dur_norm = max(0.0, min(dur / cycle_len, 1.0))
+            return (1.0, start_norm, dur_norm)
+        else:
+            # 非绿：起始偏移为当前剩余 + 后续直到遇到下一绿的时间；持续为该绿窗连续绿相位之和
+            offset = float(remain_curr)
+            dur = 0.0
+            if n > 0:
+                i = (phase_idx + 1) % n
+                # 累积到下一个绿相位的等待
+                while (not greens[i]) and i != phase_idx:
+                    offset += float(durations[i])
+                    i = (i + 1) % n
+                # 从下一个绿相位开始累积连续绿窗持续
+                j = i
+                while greens[j] and j != phase_idx:
+                    dur += float(durations[j])
+                    j = (j + 1) % n
+            start_norm = max(0.0, min(offset / cycle_len, 1.0))
+            dur_norm = max(0.0, min(dur / cycle_len, 1.0))
+            return (0.0, start_norm, dur_norm)
+
+    # --------------------------------------------------------
     def _observe(self) -> np.ndarray:
         feats: List[float] = []
 
@@ -737,7 +1376,7 @@ class CityVSLEnv(gym.Env):
         for gname in self.group_keys:
             lane_ids = self.lane_groups.get(gname, [])
             if not lane_ids:
-                feats.extend([0.0, 0.0])  # occ, speed
+                feats.extend([0.0, 0.0, 0.0])  # occ, speed, halts_norm
                 curr_occ_eb[gname] = 0.0
                 curr_speed_eb[gname] = 0.0
                 continue
@@ -746,6 +1385,7 @@ class CityVSLEnv(gym.Env):
             cached_eb = lm_local.get("eb", {}).get(gname, {})
             avg_occ = cached_eb.get("occ", None)
             avg_speed = cached_eb.get("speed", None)
+            avg_halts = cached_eb.get("halts", None)
             if avg_occ is None:
                 occs: List[float] = []
                 for lid in lane_ids:
@@ -764,11 +1404,27 @@ class CityVSLEnv(gym.Env):
                         pass
                 avg_speed = float(np.mean(speeds)) if speeds else 0.0
                 lm_local.setdefault("eb", {}).setdefault(gname, {})["speed"] = avg_speed
+            if avg_halts is None:
+                halts: List[float] = []
+                for lid in lane_ids:
+                    try:
+                        halts.append(traci.lane.getLastStepHaltingNumber(lid))
+                    except Exception:
+                        pass
+                avg_halts = float(np.mean(halts)) if halts else 0.0
+                lm_local.setdefault("eb", {}).setdefault(gname, {})["halts"] = avg_halts
             avg_speed_norm = min(avg_speed / self.max_ref_speed_mps, 1.0)
+            try:
+                self._halts_hist_eb.get(gname, deque(maxlen=self._halts_window_steps)).append(avg_halts)
+            except Exception:
+                pass
+            upper_halts = self._get_halts_upper_for_segment("eb", gname)
+            halts_norm = max(0.0, min(avg_halts / float(max(upper_halts, 1e-6)), 1.0))
             
-            # 仅输出当前占有率和速度
+            # 输出当前占有率、速度与停止车归一
             feats.append(avg_occ)
             feats.append(avg_speed_norm)
+            feats.append(halts_norm)
             curr_occ_eb[gname] = avg_occ
             curr_speed_eb[gname] = avg_speed_norm
 
@@ -776,7 +1432,7 @@ class CityVSLEnv(gym.Env):
         for gname in self.group_keys:
             lane_ids = self.wb_lane_groups.get(gname, [])
             if not lane_ids:
-                feats.extend([0.0, 0.0])
+                feats.extend([0.0, 0.0, 0.0])
                 curr_occ_wb[gname] = 0.0
                 curr_speed_wb[gname] = 0.0
                 continue
@@ -784,6 +1440,7 @@ class CityVSLEnv(gym.Env):
             cached_wb = lm_local.get("wb", {}).get(gname, {})
             avg_occ = cached_wb.get("occ", None)
             avg_speed = cached_wb.get("speed", None)
+            avg_halts = cached_wb.get("halts", None)
             if avg_occ is None:
                 occs = []
                 for lid in lane_ids:
@@ -802,14 +1459,30 @@ class CityVSLEnv(gym.Env):
                         pass
                 avg_speed = float(np.mean(speeds)) if speeds else 0.0
                 lm_local.setdefault("wb", {}).setdefault(gname, {})["speed"] = avg_speed
+            if avg_halts is None:
+                halts = []
+                for lid in lane_ids:
+                    try:
+                        halts.append(traci.lane.getLastStepHaltingNumber(lid))
+                    except Exception:
+                        pass
+                avg_halts = float(np.mean(halts)) if halts else 0.0
+                lm_local.setdefault("wb", {}).setdefault(gname, {})["halts"] = avg_halts
             avg_speed_norm = min(avg_speed / self.max_ref_speed_mps, 1.0)
+            try:
+                self._halts_hist_wb.get(gname, deque(maxlen=self._halts_window_steps)).append(avg_halts)
+            except Exception:
+                pass
+            upper_halts = self._get_halts_upper_for_segment("wb", gname)
+            halts_norm = max(0.0, min(avg_halts / float(max(upper_halts, 1e-6)), 1.0))
             
             feats.append(avg_occ)
             feats.append(avg_speed_norm)
+            feats.append(halts_norm)
             curr_occ_wb[gname] = avg_occ
             curr_speed_wb[gname] = avg_speed_norm
 
-        # 2) 三个信号：phase + remaining（简化版）
+        # 2) 信号：phase + remaining + 绿灯窗口
         for tid in self.tls_ids:
             try:
                 phase_index = traci.trafficlight.getPhase(tid)
@@ -823,32 +1496,281 @@ class CityVSLEnv(gym.Env):
             remain = max(remain, 0.0)
             remain_norm = min(float(remain) / float(max(meta["max_phase_duration"], 1.0)), 1.0)
             
-            feats.extend([phase_norm, remain_norm])
+            # 绿灯窗口：下一绿灯窗口的起始偏移与持续时间（归一到一个周期）
+            _, next_green_start_norm, next_green_dur_norm = self._get_tls_green_window_features(tid)
+            feats.extend([phase_norm, remain_norm, next_green_start_norm, next_green_dur_norm])
 
-        # 3) CAV渗透率
-        feats.append(self._get_cav_ratio())
+        # 3) 需求趋势（60s滑动，归一）
+        feats.append(float(self.metrics.get("demand_trend_norm", 0.0)))
+        # 4) 慢趋势（5分钟滑动，归一）
+        feats.append(float(self.metrics.get("demand_trend_slow_norm", 0.0)))
+
+        # 5) 全局 CAV 占比（episode 级 sanity check）
+        try:
+            global_cav_ratio = self._get_cav_ratio()
+        except Exception:
+            global_cav_ratio = 0.0
+        feats.append(global_cav_ratio)
+
+        # 6) 每段 CAV 占比（东/西向）
+        for gname in self.group_keys:
+            eb_ratio = self._get_cav_ratio_on_lanes(self.lane_groups.get(gname, []))
+            feats.append(eb_ratio)
+        for gname in self.group_keys:
+            wb_ratio = self._get_cav_ratio_on_lanes(self.wb_lane_groups.get(gname, []))
+            feats.append(wb_ratio)
+
+        # 7) 每段速度波动（与上一步的差值，归一化）
+        for gname in self.group_keys:
+            prev = float(self._prev_segment_speeds_norm.get("eb", {}).get(gname, 0.0))
+            curr = float(curr_speed_eb.get(gname, 0.0))
+            delta = max(0.0, min(abs(curr - prev), 1.0))
+            feats.append(delta)
+            self._prev_segment_speeds_norm.setdefault("eb", {})[gname] = curr
+        for gname in self.group_keys:
+            prev = float(self._prev_segment_speeds_norm.get("wb", {}).get(gname, 0.0))
+            curr = float(curr_speed_wb.get(gname, 0.0))
+            delta = max(0.0, min(abs(curr - prev), 1.0))
+            feats.append(delta)
+            self._prev_segment_speeds_norm.setdefault("wb", {})[gname] = curr
 
         return np.array(feats, dtype=np.float32)
 
     # --------------------------------------------------------
     def _compute_reward_per_step(self) -> float:
         """
-        简单、可验证的奖励函数（轻量版）
-        
-        设计目标：
-        - 稳定：避免动态权重与过多分量引入的噪声
-        - 高效：减少 TraCI 调用，提升步速
-        - 可解释：显式记录各奖励分量，便于可视化与调参
-        
-        组成：
-        - 效率奖励 r_efficiency：双向三段平均速度 / 参考最大速度（∈[0,1]）
-        - 拥堵惩罚 r_congestion：双向三段平均停止车辆数（按 5 辆/车道归一，∈[0,1]）
-        - 合成：total = w_eff*r_efficiency + w_cong*(-r_congestion)
+        多目标奖励（覆盖旅行时间/延误、排队溢出、停车延迟、能耗代理、速度平滑、绿波协调、吞吐与需求稳健）。
+
+        统一将各子项归一到 [0,1] 后按权重组合：
+        total = +w_coord*coord + w_eff*speed_norm + w_thru*throughput
+                -w_delay*delay - w_qov*queue_overflow - w_stops*stops
+                -w_fuel*fuel - w_smooth*smooth - w_robust*robust
         """
         try:
-            return self._compute_reward_per_step_simple()
+            # 1) 读取缓存/回退采集
+            lm = self._step_cache.get("lane_metrics")
+            if lm is None:
+                self._collect_lane_group_metrics(need_occ=False)
+                lm = self._step_cache.get("lane_metrics", {"eb": {}, "wb": {}})
+
+            # 2) 基础量：速度（归一）、停止车（归一：动态上限）
+            speeds_norm: List[float] = []
+            halts_norms: List[float] = []
+
+            def _seg_len_avg(direction: str, segment: str) -> float:
+                lane_ids = (self.lane_groups if direction == "eb" else self.wb_lane_groups).get(segment, [])
+                if not lane_ids:
+                    return 0.0
+                lengths: List[float] = []
+                for lid in lane_ids:
+                    try:
+                        L = float(self._lane_length_cache.get(lid)) if lid in self._lane_length_cache else float(traci.lane.getLength(lid))
+                        self._lane_length_cache[lid] = L
+                        lengths.append(L)
+                    except Exception:
+                        pass
+                return float(np.mean(lengths)) if lengths else 0.0
+
+            delay_norms: List[float] = []
+            smooth_deltas: List[float] = []
+
+            for direction in ("eb", "wb"):
+                for g in self.group_keys:
+                    vals = lm.get(direction, {}).get(g, {})
+                    v_mps = float(vals.get("speed", 0.0))
+                    v_norm = max(0.0, min(v_mps / max(self.max_ref_speed_mps, 1e-6), 1.0))
+                    speeds_norm.append(v_norm)
+
+                    avg_halts = float(vals.get("halts", 0.0))
+                    upper_halts = self._get_halts_upper_for_segment(direction, g)
+                    hn = max(0.0, min(avg_halts / float(max(upper_halts, 1e-6)), 1.0))
+                    halts_norms.append(hn)
+
+                    # 旅行时间/延误（基于段均长度与平均速度近似）
+                    L = _seg_len_avg(direction, g)
+                    if L > 0.0:
+                        t_free = L / float(max(self.max_ref_speed_mps, 1e-6))
+                        t_act = L / float(max(v_mps, 1e-3))
+                        extra_ratio = max(0.0, (t_act / float(max(t_free, 1e-6))) - 1.0)
+                        d_norm = max(0.0, min(extra_ratio / float(max(self.delay_max_ratio_extra, 1e-6)), 1.0))
+                        delay_norms.append(d_norm)
+
+                    # 速度波动（与上一步测得的差异，归一）
+                    prev = float(self._prev_meas_segment_speeds_norm.get(direction, {}).get(g, 0.0))
+                    curr = v_norm
+                    delta = max(0.0, min(abs(curr - prev), 1.0))
+                    smooth_deltas.append(delta)
+                    self._prev_meas_segment_speeds_norm.setdefault(direction, {})[g] = curr
+
+            speed_norm = float(np.mean(speeds_norm)) if speeds_norm else 0.0
+            halting_norm = float(np.mean(halts_norms)) if halts_norms else 0.0
+
+            # 3) 队列溢出惩罚（超阈值部分）
+            queue_overflow = float(np.mean([max(h - self.queue_overflow_threshold, 0.0) for h in halts_norms])) if halts_norms else 0.0
+
+            # 4) 停车惩罚（基于 halts_norm）
+            stops_pen = halting_norm
+
+            # 5) 延误惩罚（平均）
+            delay_pen = float(np.mean(delay_norms)) if delay_norms else 0.0
+
+            # 6) 能耗代理或真实燃油
+            fuel_norm = 0.0
+            if self.use_real_fuel:
+                try:
+                    corr_lanes = set(sum([self.lane_groups.get(k, []) for k in self.group_keys], [])) | set(sum([self.wb_lane_groups.get(k, []) for k in self.group_keys], []))
+                    total_fc = 0.0
+                    vids = []
+                    try:
+                        vids = traci.vehicle.getIDList()
+                    except Exception:
+                        vids = []
+                    for vid in vids:
+                        try:
+                            lid = traci.vehicle.getLaneID(vid)
+                            if lid in corr_lanes:
+                                total_fc += float(traci.vehicle.getFuelConsumption(vid))
+                        except Exception:
+                            pass
+                    self._fuel_hist.append(total_fc)
+                    # 归一：相对窗口 P95（兜底用均值）
+                    ref = 0.0
+                    try:
+                        arr = np.array(list(self._fuel_hist), dtype=np.float32)
+                        if arr.size > 0:
+                            ref = float(np.percentile(arr, 95)) if arr.size >= 5 else float(np.mean(arr))
+                    except Exception:
+                        ref = 0.0
+                    if ref > 0.0:
+                        fuel_norm = max(0.0, min(total_fc / ref, 1.0))
+                    else:
+                        fuel_norm = 0.0
+                except Exception:
+                    fuel_norm = 0.0
+            else:
+                # 代理：以怠速（halts）与速度波动联合近似
+                fuel_norm = max(0.0, min(0.6 * halting_norm + 0.4 * (float(np.mean(smooth_deltas)) if smooth_deltas else 0.0), 1.0))
+
+            # 7) 速度平滑惩罚（平均速度差）
+            smooth_pen = float(np.mean(smooth_deltas)) if smooth_deltas else 0.0
+
+            # 8) 绿波/协调奖励（信号就绪度）
+            coord_vals: List[float] = []
+            for tid in (self.tls_ids or []):
+                try:
+                    is_green_now, start_norm, dur_norm = self._get_tls_green_window_features(tid)
+                except Exception:
+                    is_green_now, start_norm, dur_norm = (0.0, 1.0, 0.0)
+                # 简化就绪度：当前绿=1；否则以“持续-起始偏移”衡量下一绿窗可达性
+                ready = 1.0 if is_green_now == 1.0 else max(0.0, dur_norm - start_norm)
+                coord_vals.append(max(0.0, min(ready, 1.0)))
+            coordination = float(np.mean(coord_vals)) if coord_vals else 0.0
+
+            # 8.1) 信号遵从惩罚与绿窗通过激励
+            safe_mps_red = 12.0
+            signal_pen_vals: List[float] = []
+            green_pass_vals: List[float] = []
+            for direction in ("eb", "wb"):
+                for g in self.group_keys:
+                    tls_id = self.segment_tls_map.get(direction, {}).get(g)
+                    if not tls_id:
+                        continue
+                    vals = lm.get(direction, {}).get(g, {})
+                    v_mps = float(vals.get("speed", 0.0))
+                    try:
+                        is_green_now, start_norm, dur_norm = self._get_tls_green_window_features(tls_id)
+                    except Exception:
+                        is_green_now, start_norm, dur_norm = (0.0, 1.0, 0.0)
+                    # 红灯期间仍高速的惩罚（相对参考速度归一）
+                    if is_green_now < 1.0 and v_mps > safe_mps_red:
+                        signal_pen_vals.append(max(0.0, min((v_mps - safe_mps_red) / float(max(self.max_ref_speed_mps, 1e-6)), 1.0)))
+                    # 绿窗通过奖励：预测到达时间位于即将到来的绿窗内
+                    meta = self._tls_cycle_meta.get(tls_id, {})
+                    cycle_len = float(meta.get("cycle_len", 60.0))
+                    start_sec = float(start_norm) * cycle_len
+                    dur_sec = float(dur_norm) * cycle_len
+                    # 段平均长度与预计通过时间
+                    L = 0.0
+                    lane_ids = (self.lane_groups if direction == "eb" else self.wb_lane_groups).get(g, [])
+                    if lane_ids:
+                        lens: List[float] = []
+                        for lid in lane_ids:
+                            try:
+                                L_i = float(self._lane_length_cache.get(lid)) if lid in self._lane_length_cache else float(traci.lane.getLength(lid))
+                                self._lane_length_cache[lid] = L_i
+                                lens.append(L_i)
+                            except Exception:
+                                pass
+                        L = float(np.mean(lens)) if lens else 0.0
+                    if L > 0.0 and v_mps > 0.1:
+                        eta = L / float(max(v_mps, 1e-3))
+                        arrive_in_window = (eta >= start_sec) and (eta <= (start_sec + dur_sec))
+                        green_pass_vals.append(1.0 if arrive_in_window else 0.0)
+
+            signal_compliance_pen = float(np.mean(signal_pen_vals)) if signal_pen_vals else 0.0
+            green_pass_reward = float(np.mean(green_pass_vals)) if green_pass_vals else 0.0
+
+            # 9) 吞吐奖励（使用已计算的趋势归一）
+            throughput = float(self.metrics.get("demand_trend_norm", 0.0))
+
+            # 10) 需求趋势稳健惩罚（在需求上升且仍高速且队列小的情形施加惩罚）
+            trend_fast = float(self.metrics.get("demand_trend_norm", 0.0))
+            robust_pen = 0.0
+            if trend_fast > 0.6 and speed_norm > 0.6 and halting_norm < 0.2:
+                robust_pen = max(0.0, min((trend_fast - 0.6) / 0.4, 1.0))
+
+            # 11) 组合奖励
+            total = 0.0
+            total += self.rw.get("coordination", 0.0) * coordination
+            total += self.rw.get("efficiency", 0.0) * speed_norm
+            total += self.rw.get("throughput", 0.0) * throughput
+            total -= self.rw.get("delay", 0.0) * delay_pen
+            total -= self.rw.get("queue_overflow", 0.0) * queue_overflow
+            total -= self.rw.get("stops", 0.0) * stops_pen
+            total -= self.rw.get("fuel", 0.0) * fuel_norm
+            total -= self.rw.get("smoothness", 0.0) * smooth_pen
+            total -= self.rw.get("demand_robust", 0.0) * robust_pen
+            # 信号遵从（负）与绿窗通过（正）
+            total -= self.rw.get("signal_compliance", 0.0) * signal_compliance_pen
+            total += self.rw.get("green_pass", 0.0) * green_pass_reward
+
+            # 可选裁剪
+            if (self._reward_clip_min is not None) or (self._reward_clip_max is not None):
+                clip_min = self._reward_clip_min if self._reward_clip_min is not None else -float("inf")
+                clip_max = self._reward_clip_max if self._reward_clip_max is not None else float("inf")
+                total = float(np.clip(total, clip_min, clip_max))
+
+            # 记录奖励分量（用于分析/可视化）
+            try:
+                self.metrics["r_efficiency"] = self.rw.get("efficiency", 0.0) * speed_norm
+                self.metrics["r_throughput"] = self.rw.get("throughput", 0.0) * throughput
+                self.metrics["r_coordination"] = self.rw.get("coordination", 0.0) * coordination
+                self.metrics["r_delay"] = -self.rw.get("delay", 0.0) * delay_pen
+                self.metrics["r_queue_overflow"] = -self.rw.get("queue_overflow", 0.0) * queue_overflow
+                self.metrics["r_stops"] = -self.rw.get("stops", 0.0) * stops_pen
+                self.metrics["r_fuel"] = -self.rw.get("fuel", 0.0) * fuel_norm
+                self.metrics["r_smoothness"] = -self.rw.get("smoothness", 0.0) * smooth_pen
+                self.metrics["r_demand_robust"] = -self.rw.get("demand_robust", 0.0) * robust_pen
+                self.metrics["r_signal_compliance"] = -self.rw.get("signal_compliance", 0.0) * signal_compliance_pen
+                self.metrics["r_green_pass"] = self.rw.get("green_pass", 0.0) * green_pass_reward
+                self.metrics["r_total"] = total
+                # 便于直观监控的原始量
+                self.metrics["r_speed_mean_mps"] = float(np.mean([float(lm.get("eb", {}).get(g, {}).get("speed", 0.0)) for g in self.group_keys] + [float(lm.get("wb", {}).get(g, {}).get("speed", 0.0)) for g in self.group_keys])) if lm else 0.0
+                self.metrics["r_halting_avg"] = halting_norm
+
+                # 累计归一指标（供 episode 结束平均）
+                self.metrics["delay_sum_norm"] += float(delay_pen)
+                self.metrics["delay_steps"] += 1
+                self.metrics["stops_sum_norm"] += float(stops_pen)
+                self.metrics["stops_steps"] += 1
+                self.metrics["smooth_sum_norm"] += float(smooth_pen)
+                self.metrics["smooth_steps"] += 1
+            except Exception:
+                pass
+
+            return total
         except Exception as e:
-            print(f"[奖励计算] 简单版奖励计算失败: {e}")
+            print(f"[奖励计算] 多目标奖励计算失败: {e}")
             return 0.0
     # --------------------------------------------------------
 

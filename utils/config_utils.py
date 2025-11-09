@@ -146,8 +146,20 @@ def validate_env_config(cfg: dict, root_dir: Optional[str] = None) -> None:
     if pen_f < 0.0 or pen_f > 1.0:
         _err("penetration 必须在 [0.0, 1.0] 范围内")
 
-    # 9) reward weights
-    for key in ("reward_speed_weight", "reward_congestion_weight"):
+    # 9) reward weights（扩展多目标）
+    for key in (
+        "reward_speed_weight",
+        "reward_congestion_weight",
+        "reward_delay_weight",
+        "reward_queue_overflow_weight",
+        "reward_stops_weight",
+        "reward_fuel_weight",
+        "reward_smoothness_weight",
+        "reward_coordination_weight",
+        "reward_throughput_weight",
+        "reward_demand_robust_weight",
+        "reward_change_penalty",
+    ):
         val = cfg.get(key)
         try:
             vf = float(val)
@@ -155,6 +167,19 @@ def validate_env_config(cfg: dict, root_dir: Optional[str] = None) -> None:
             vf = -1.0
         if vf < 0.0:
             _err(f"{key} 必须为非负数")
+
+    # 10) 可选奖励阈值与裁剪项（若提供则做基本校验）
+    for key in (
+        "reward_queue_overflow_threshold",
+        "reward_delay_max_ratio_extra",
+        "reward_clip_min",
+        "reward_clip_max",
+    ):
+        if key in cfg and cfg.get(key) is not None:
+            try:
+                float(cfg.get(key))
+            except Exception:
+                _warn(f"{key} 非数值，将使用默认值或忽略")
 
     # 可选项与弃用项提示
     if "max_steps" in cfg:

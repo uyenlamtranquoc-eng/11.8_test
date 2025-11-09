@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from envs.city_vsl_env import CityVSLEnv  # noqa
 from rl.sac_agent import MultiHeadSACAgent  # 多头离散SAC（基础实现）
-from rl.replay_buffer import ReplayBuffer  # 简单均匀采样经验回放
+from rl.replay_buffer import ReplayBuffer, HierarchicalReplayBuffer  # 均匀/分层采样回放
 import pickle
 
 # common utils
@@ -119,10 +119,22 @@ def main():
         # 从 env.yaml 接入奖励权重与暖机步数
         reward_speed_weight=float(cfg.get("reward_speed_weight", 1.0)),
         reward_congestion_weight=float(cfg.get("reward_congestion_weight", 1.0)),
+        reward_delay_weight=float(cfg.get("reward_delay_weight", 1.0)),
+        reward_queue_overflow_weight=float(cfg.get("reward_queue_overflow_weight", 1.0)),
+        reward_stops_weight=float(cfg.get("reward_stops_weight", 0.5)),
+        reward_fuel_weight=float(cfg.get("reward_fuel_weight", 0.1)),
+        reward_smoothness_weight=float(cfg.get("reward_smoothness_weight", 0.2)),
+        reward_coordination_weight=float(cfg.get("reward_coordination_weight", 0.5)),
+        reward_throughput_weight=float(cfg.get("reward_throughput_weight", 0.3)),
+        reward_demand_robust_weight=float(cfg.get("reward_demand_robust_weight", 0.3)),
         reward_change_penalty=float(cfg.get("reward_change_penalty", 0.1)),
+        reward_queue_overflow_threshold=float(cfg.get("reward_queue_overflow_threshold", 0.8)),
+        reward_delay_max_ratio_extra=float(cfg.get("reward_delay_max_ratio_extra", 3.0)),
+        reward_use_real_fuel=bool(cfg.get("reward_use_real_fuel", False)),
         warmup_steps=int(cfg.get("warmup_steps", 5)),
         reward_clip_min=_rc_min,
         reward_clip_max=_rc_max,
+        norm_cfg=cfg.get("norm", None),
     )
 
     obs, _ = env.reset()
@@ -150,14 +162,30 @@ def main():
         alpha=float(cfg.get("sac_alpha", 0.15)),
         hidden_size=int(cfg.get("hidden_size", 256)),
         max_grad_norm=float(cfg.get("grad_clip_norm", 5.0)),
+        auto_alpha=bool(cfg.get("sac_auto_alpha", True)),
+        alpha_lr=float(cfg.get("sac_alpha_lr", cfg.get("actor_lr", cfg.get("learning_rate", 5e-4)))),
+        target_entropy_scale=float(cfg.get("sac_target_entropy_scale", 1.0)),
+        use_joint_action_constraint=bool(cfg.get("use_joint_action_constraint", True)),
+        actor_use_layer_norm=bool(cfg.get("actor_use_layer_norm", True)),
     )
     print(f"[SAC] 使用 Polyak 软更新，tau={float(cfg.get('sac_tau', 0.005)):.4f}")
 
-    # 统一使用基础均匀采样回放
-    buffer = ReplayBuffer(
-        capacity=int(cfg.get("buffer_size", 200000)),
-        obs_dim=obs_dim,
-    )
+    # 经验回放：分层优先（默认启用）> 均匀
+    use_hier = bool(cfg.get("use_hier_replay", True))
+    if use_hier:
+        buffer = HierarchicalReplayBuffer(
+            capacity=int(cfg.get("buffer_size", 200000)),
+            obs_dim=obs_dim,
+            sample_weights=cfg.get("hier_sample_weights", None),
+            delta_threshold_mps=float(cfg.get("hier_delta_threshold_mps", 2.0)),
+        )
+        print("[replay] 使用分层经验回放 (stratified)")
+    else:
+        buffer = ReplayBuffer(
+            capacity=int(cfg.get("buffer_size", 200000)),
+            obs_dim=obs_dim,
+        )
+        print("[replay] 使用均匀采样回放")
     batch_size = int(cfg.get("batch_size", 128))
 
     # 预填充经验池（随机策略）
@@ -175,7 +203,7 @@ def main():
                 action = _np.array([int(_np.random.randint(0, n)) for n in nvec], dtype=_np.int64)
             next_obs, reward, terminated, truncated, _info = env.step(action)
             # 基础均匀采样回放
-            buffer.push(obs, action, reward, next_obs, bool(terminated or truncated))  # type: ignore
+            buffer.push(obs, action, reward, next_obs, bool(terminated or truncated), _info)  # type: ignore
             obs = next_obs if not (terminated or truncated) else env.reset()[0]
             filled += 1
         print(f"[prefill] done filled={filled}")
@@ -200,7 +228,7 @@ def main():
     metrics_csv = os.path.join(metrics_dir, "train_metrics.csv")
     if not os.path.exists(metrics_csv):
         with open(metrics_csv, "w", encoding="utf-8") as f:
-            f.write("ep,algo,tau,reward,avg20,alpha,avg_queue_veh,throughput_veh_per_hour,arrived_total,sim_seconds\n")
+            f.write("ep,algo,tau,reward,avg20,alpha,avg_queue_veh,throughput_veh_per_hour,arrived_total,sim_seconds,avg_delay_norm,avg_stops_norm,avg_speed_fluct_norm\n")
     best_avg20 = -1e18
     best_ckpt = None
 
@@ -225,10 +253,11 @@ def main():
 
                 done_flag = bool(terminated or truncated)
                 # 基础回放：均匀采样 FIFO
-                buffer.push(obs, action, reward, next_obs, done_flag)  # type: ignore
+                buffer.push(obs, action, reward, next_obs, done_flag, info)  # type: ignore
 
                 if len(buffer) >= batch_size:
-                    metrics = agent.update(buffer.sample(batch_size))
+                    batch = buffer.sample(batch_size)
+                    metrics = agent.update(batch)
                     loss = metrics.get('total_loss', None)
                 else:
                     loss = None
@@ -257,7 +286,7 @@ def main():
         alpha_val = getattr(agent, "temperature", 0.0)
         with open(metrics_csv, "a", encoding="utf-8") as f:
             f.write(
-                f"{ep},sac,{float(cfg.get('sac_tau', 0.0) or 0.0):.6f},{ep_reward:.6f},{avg20:.6f},{alpha_val:.6f},{m.get('avg_queue_veh',0.0):.6f},{m.get('throughput_veh_per_hour',0.0):.6f},{int(m.get('arrived_total',0) or 0):d},{float(m.get('sim_seconds',0.0) or 0.0):.6f}\n"
+                f"{ep},sac,{float(cfg.get('sac_tau', 0.0) or 0.0):.6f},{ep_reward:.6f},{avg20:.6f},{alpha_val:.6f},{m.get('avg_queue_veh',0.0):.6f},{m.get('throughput_veh_per_hour',0.0):.6f},{int(m.get('arrived_total',0) or 0):d},{float(m.get('sim_seconds',0.0) or 0.0):.6f},{m.get('avg_delay_norm',0.0):.6f},{m.get('avg_stops_norm',0.0):.6f},{m.get('avg_speed_fluct_norm',0.0):.6f}\n"
             )
 
         # 基础版：不保存环境绑定的完整检查点，统一使用智能体检查点
